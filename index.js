@@ -1,5 +1,9 @@
 'use strict';
 
+// Railway : npm start, une seule réplique.
+// Variables requises : DISCORD_TOKEN et DISCORD_GUILD_ID.
+// Présence uniquement : aucun enregistrement ni résumé.
+
 const {
   Client,
   GatewayIntentBits,
@@ -16,14 +20,13 @@ const {
   VoiceConnectionStatus: V,
 } = require('@discordjs/voice');
 
-// Variables Railway obligatoires.
 for (const name of ['DISCORD_TOKEN', 'DISCORD_GUILD_ID']) {
   if (!process.env[name]?.trim()) {
-    throw new Error(`Variable manquante: ${name}`);
+    throw new Error(`Variable manquante : ${name}`);
   }
 }
 
-const guildId = process.env.DISCORD_GUILD_ID;
+const guildId = process.env.DISCORD_GUILD_ID.trim();
 
 if (!/^\d{17,20}$/.test(guildId)) {
   throw new Error('DISCORD_GUILD_ID invalide.');
@@ -57,6 +60,7 @@ function disconnect() {
   reconnectTimer = null;
 
   const previous = connection;
+
   connection = null;
   selectedChannel = null;
 
@@ -90,13 +94,16 @@ const commands = [
 client.on(Events.InteractionCreate, async interaction => {
   if (
     !interaction.isChatInputCommand() ||
-    !commands.some(c => c.name === interaction.commandName)
+    !commands.some(
+      command => command.name === interaction.commandName
+    )
   ) {
     return;
   }
 
   try {
-    // Confirmation privée, jamais de message public.
+    // Réponse visible uniquement par la personne
+    // qui utilise la commande.
     await interaction.deferReply({
       flags: MessageFlags.Ephemeral,
     });
@@ -125,7 +132,11 @@ client.on(Events.InteractionCreate, async interaction => {
     try {
       if (interaction.commandName === 'live-quitter') {
         disconnect();
-        await interaction.editReply('Déconnecté du live.');
+
+        await interaction.editReply(
+          'Déconnecté du live.'
+        );
+
         return;
       }
 
@@ -139,7 +150,9 @@ client.on(Events.InteractionCreate, async interaction => {
         interaction.options.getChannel('salon', true);
 
       const channel =
-        await interaction.guild.channels.fetch(chosenChannel.id);
+        await interaction.guild.channels.fetch(
+          chosenChannel.id
+        );
 
       if (
         ![
@@ -152,7 +165,8 @@ client.on(Events.InteractionCreate, async interaction => {
         );
       }
 
-      const me = await interaction.guild.members.fetchMe();
+      const me =
+        await interaction.guild.members.fetchMe();
 
       if (
         !channel.permissionsFor(me)?.has([
@@ -174,7 +188,7 @@ client.on(Events.InteractionCreate, async interaction => {
         adapterCreator:
           interaction.guild.voiceAdapterCreator,
 
-        // Bot muet et sourd : présence uniquement.
+        // Présence uniquement : muet et sourd.
         selfMute: true,
         selfDeaf: true,
       });
@@ -198,7 +212,9 @@ client.on(Events.InteractionCreate, async interaction => {
           // Laisser la bibliothèque rétablir
           // une coupure transitoire.
           reconnectTimer = setTimeout(() => {
-            if (connection === current) disconnect();
+            if (connection === current) {
+              disconnect();
+            }
           }, 20000);
         } else if (state.status === V.Destroyed) {
           disconnect();
@@ -206,7 +222,11 @@ client.on(Events.InteractionCreate, async interaction => {
       });
 
       try {
-        await entersState(current, V.Ready, 30000);
+        await entersState(
+          current,
+          V.Ready,
+          30000
+        );
 
         if (
           connection !== current ||
@@ -217,8 +237,10 @@ client.on(Events.InteractionCreate, async interaction => {
           );
         }
 
-        // Sur un Stage, rester dans le public.
-        if (channel.type === ChannelType.GuildStageVoice) {
+        // Sur un Stage, le bot reste dans le public.
+        if (
+          channel.type === ChannelType.GuildStageVoice
+        ) {
           await me.voice.setSuppressed(true);
         }
 
@@ -228,7 +250,9 @@ client.on(Events.InteractionCreate, async interaction => {
       } catch (error) {
         disconnect();
 
-        if (error instanceof UserError) throw error;
+        if (error instanceof UserError) {
+          throw error;
+        }
 
         logError('Connexion impossible', error);
 
@@ -254,53 +278,90 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 });
 
-client.on(Events.VoiceStateUpdate, (before, after) => {
-  if (
-    !connection ||
-    after.id !== client.user?.id ||
-    after.guild.id !== guildId
-  ) {
-    return;
-  }
+client.on(
+  Events.VoiceStateUpdate,
+  (before, after) => {
+    if (
+      !connection ||
+      after.id !== client.user?.id ||
+      after.guild.id !== guildId
+    ) {
+      return;
+    }
 
-  if (
-    before.channelId === selectedChannel &&
-    after.channelId !== selectedChannel
-  ) {
-    // Ne pas revenir après une exclusion ou un déplacement.
-    disconnect();
-  } else if (
-    after.channel?.type === ChannelType.GuildStageVoice &&
-    after.suppress === false
-  ) {
-    // Revenir dans le public si le bot est promu intervenant.
-    void after.setSuppressed(true).catch(error => {
-      logError('Retour en auditeur', error);
+    if (
+      before.channelId === selectedChannel &&
+      after.channelId !== selectedChannel
+    ) {
+      // Ne pas revenir après une exclusion
+      // ou un déplacement par un modérateur.
       disconnect();
-    });
+    } else if (
+      after.channel?.type ===
+        ChannelType.GuildStageVoice &&
+      after.suppress === false
+    ) {
+      // Revenir dans le public si le bot
+      // est promu intervenant.
+      void after.setSuppressed(true).catch(error => {
+        logError('Retour en auditeur', error);
+        disconnect();
+      });
+    }
   }
-});
+);
 
 client.on(Events.Error, error => {
   logError('Discord', error);
 });
 
 client.once(Events.ClientReady, async () => {
-  try {
-    const guild = await client.guilds.fetch(guildId);
+  let step = 'Vérification du serveur';
 
-    // Enregistrer les commandes automatiquement.
-    // Les éventuelles autres commandes sont conservées.
+  try {
+    console.log(
+      `Bot connecté: ${client.user.tag} (${client.user.id})`
+    );
+
+    console.log(
+      `Serveur demandé: ${guildId}`
+    );
+
+    console.log(
+      `Serveurs visibles: ${
+        [...client.guilds.cache.keys()].join(', ') ||
+        'aucun'
+      }`
+    );
+
+    // Utiliser le serveur déjà reçu via Discord.
+    // Le récupérer par l’API uniquement s’il
+    // n’est pas disponible en cache.
+    const guild =
+      client.guilds.cache.get(guildId) ||
+      await client.guilds.fetch(guildId);
+
+    // Enregistrer les deux commandes sans
+    // effacer les éventuelles autres commandes.
     for (const command of commands) {
-      await guild.commands.create(command.toJSON());
+      step = `Enregistrement de /${command.name}`;
+
+      await guild.commands.create(
+        command.toJSON()
+      );
     }
 
     ready = true;
+
     console.log(
-      'Bot prêt : présence uniquement, muet et sourd.'
+      'Bot prêt: présence uniquement, muet et sourd.'
     );
   } catch (error) {
-    logError('Démarrage', error);
+    logError(
+      `Démarrage - ${step}`,
+      error
+    );
+
     shutdown(1);
   }
 });
@@ -309,13 +370,20 @@ function shutdown(code = 0) {
   if (stopping) return;
 
   stopping = true;
+
   disconnect();
   client.destroy();
+
   process.exit(code);
 }
 
-process.once('SIGTERM', () => shutdown());
-process.once('SIGINT', () => shutdown());
+process.once('SIGTERM', () => {
+  shutdown();
+});
+
+process.once('SIGINT', () => {
+  shutdown();
+});
 
 process.once('uncaughtException', error => {
   logError('Erreur fatale', error);
