@@ -1,16 +1,8 @@
 'use strict';
 
-// Variables Railway : DISCORD_TOKEN et DISCORD_GUILD_ID.
-// Présence uniquement : aucun enregistrement ni résumé.
-
 const {
-  Client,
-  GatewayIntentBits,
-  Events,
-  ChannelType,
-  PermissionFlagsBits: P,
-  SlashCommandBuilder,
-  MessageFlags,
+  Client, GatewayIntentBits, Events, ChannelType,
+  PermissionFlagsBits: P, SlashCommandBuilder, MessageFlags,
 } = require('discord.js');
 
 const {
@@ -19,347 +11,381 @@ const {
   VoiceConnectionStatus: V,
 } = require('@discordjs/voice');
 
-for (const name of ['DISCORD_TOKEN', 'DISCORD_GUILD_ID']) {
-  if (!process.env[name]?.trim()) {
-    throw new Error(`Variable manquante : ${name}`);
-  }
-}
+const guildId = process.env.DISCORD_GUILD_ID?.trim();
 
-const guildId = process.env.DISCORD_GUILD_ID.trim();
+const allowed = new Set(
+  (process.env.ALLOWED_USER_IDS || '')
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean)
+);
 
-if (!/^\d{17,20}$/.test(guildId)) {
+if (!/^\d{17,20}$/.test(guildId || '')) {
   throw new Error('DISCORD_GUILD_ID invalide.');
 }
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-  ],
-});
-
-let connection = null;
-let selectedChannel = null;
-let busy = false;
-let ready = false;
-let stopping = false;
-let reconnectTimer = null;
-
-class UserError extends Error {}
-
-function logError(where, error) {
-  // Ne jamais afficher d'objet pouvant contenir le token.
-  console.error(
-    `${where}: ${error?.code || error?.name || 'Erreur'}`
+if (
+  !allowed.size ||
+  [...allowed].some(id => !/^\d{17,20}$/.test(id))
+) {
+  throw new Error(
+    'ALLOWED_USER_IDS doit contenir vos identifiants Discord, séparés par des virgules.'
   );
 }
 
-function disconnect() {
-  clearTimeout(reconnectTimer);
-  reconnectTimer = null;
+const tokens = [];
 
-  const previous = connection;
+for (let i = 1; i <= 30; i++) {
+  const token = process.env[`BOT_TOKEN_${i}`]?.trim();
+  if (token) tokens.push(token);
+}
 
-  connection = null;
-  selectedChannel = null;
+if (!tokens.length || new Set(tokens).size !== tokens.length) {
+  throw new Error(
+    'Ajoute BOT_TOKEN_1 puis les autres jetons, tous différents.'
+  );
+}
 
-  if (previous && previous.state.status !== V.Destroyed) {
-    previous.destroy();
+let ready = false;
+let busy = false;
+let stopping = false;
+
+const actors = tokens.map((token, index) => ({
+  token,
+  index,
+  connection: null,
+  channelId: null,
+  timer: null,
+  client: new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildVoiceStates,
+    ],
+  }),
+}));
+
+const controller = actors[0].client;
+
+const command = new SlashCommandBuilder()
+  .setName('netcord-live')
+  .setDescription('Piloter les présences Netcord dans un live')
+  .setDefaultMemberPermissions(P.ManageGuild)
+  .addSubcommand(s =>
+    s.setName('rejoindre')
+      .setDescription('Connecter tous les bots au live')
+      .addChannelOption(o =>
+        o.setName('salon')
+          .setDescription('Salon vocal ou Stage')
+          .setRequired(true)
+          .addChannelTypes(
+            ChannelType.GuildVoice,
+            ChannelType.GuildStageVoice
+          )
+      )
+  )
+  .addSubcommand(s =>
+    s.setName('quitter')
+      .setDescription('Déconnecter tous les bots')
+  );
+
+function logError(label, error) {
+  // Ne pas afficher les objets d’erreur pouvant contenir des secrets.
+  console.error(
+    `${label}: ${error?.code || error?.name || 'Erreur'}`
+  );
+}
+
+function disconnect(actor) {
+  clearTimeout(actor.timer);
+  actor.timer = null;
+
+  const old = actor.connection;
+  actor.connection = null;
+  actor.channelId = null;
+
+  if (old && old.state.status !== V.Destroyed) {
+    old.destroy();
   }
 }
 
-const commands = [
-  new SlashCommandBuilder()
-    .setName('live-rejoindre')
-    .setDescription('Rejoindre un live en restant muet')
-    .setDefaultMemberPermissions(P.ManageGuild)
-    .addChannelOption(option =>
-      option
-        .setName('salon')
-        .setDescription('Salon vocal ou Stage à rejoindre')
-        .setRequired(true)
-        .addChannelTypes(
-          ChannelType.GuildVoice,
-          ChannelType.GuildStageVoice
-        )
-    ),
+const delay = ms =>
+  new Promise(resolve => setTimeout(resolve, ms));
 
-  new SlashCommandBuilder()
-    .setName('live-quitter')
-    .setDescription('Quitter le live')
-    .setDefaultMemberPermissions(P.ManageGuild),
-];
+async function join(actor, channelId) {
+  const guild = actor.client.guilds.cache.get(guildId);
+  if (!guild) throw new Error('Serveur inaccessible');
 
-client.on(Events.InteractionCreate, async interaction => {
+  const channel = await guild.channels.fetch(channelId);
+  const me = await guild.members.fetchMe();
+
+  if (
+    ![
+      ChannelType.GuildVoice,
+      ChannelType.GuildStageVoice,
+    ].includes(channel?.type) ||
+    !channel.permissionsFor(me)?.has([P.ViewChannel, P.Connect]) ||
+    !channel.joinable
+  ) {
+    throw new Error('Salon inaccessible ou plein');
+  }
+
+  disconnect(actor);
+  actor.channelId = channelId;
+
+  const connection = joinVoiceChannel({
+    channelId,
+    guildId,
+    adapterCreator: guild.voiceAdapterCreator,
+
+    // Indispensable pour plusieurs bots dans un même programme.
+    group: actor.client.user.id,
+
+    selfMute: true,
+    selfDeaf: true,
+  });
+
+  actor.connection = connection;
+
+  connection.on('error', error =>
+    logError(`Vocal bot ${actor.index + 1}`, error)
+  );
+
+  connection.on('stateChange', (_, state) => {
+    if (actor.connection !== connection) return;
+
+    if (state.status === V.Ready) {
+      clearTimeout(actor.timer);
+      actor.timer = null;
+    } else if (
+      state.status === V.Disconnected &&
+      !actor.timer
+    ) {
+      actor.timer = setTimeout(() => disconnect(actor), 20000);
+    } else if (state.status === V.Destroyed) {
+      disconnect(actor);
+    }
+  });
+
+  try {
+    await entersState(connection, V.Ready, 20000);
+
+    if (
+      actor.connection !== connection ||
+      me.voice.channelId !== channelId
+    ) {
+      throw new Error('Connexion interrompue');
+    }
+
+    if (channel.type === ChannelType.GuildStageVoice) {
+      await me.voice.setSuppressed(true);
+    }
+  } catch (error) {
+    disconnect(actor);
+    throw error;
+  }
+}
+
+for (const actor of actors) {
+  actor.client.on(Events.Error, error =>
+    logError(`Discord bot ${actor.index + 1}`, error)
+  );
+
+  actor.client.on(Events.VoiceStateUpdate, (before, after) => {
+    if (
+      !actor.connection ||
+      after.id !== actor.client.user?.id ||
+      after.guild.id !== guildId
+    ) {
+      return;
+    }
+
+    if (
+      before.channelId === actor.channelId &&
+      after.channelId !== actor.channelId
+    ) {
+      // Respecter une exclusion ou un déplacement par un modérateur.
+      disconnect(actor);
+    } else if (
+      after.channel?.type === ChannelType.GuildStageVoice &&
+      after.suppress === false
+    ) {
+      void after.setSuppressed(true).catch(error => {
+        logError('Retour en auditeur', error);
+        disconnect(actor);
+      });
+    }
+  });
+}
+
+controller.on(Events.InteractionCreate, async interaction => {
   if (
     !interaction.isChatInputCommand() ||
-    !commands.some(
-      command => command.name === interaction.commandName
-    )
+    interaction.commandName !== 'netcord-live'
   ) {
     return;
   }
 
   try {
-    // Confirmation privée, sans message public.
     await interaction.deferReply({
       flags: MessageFlags.Ephemeral,
     });
 
     if (
       interaction.guildId !== guildId ||
-      !interaction.memberPermissions?.has(P.ManageGuild)
+      !allowed.has(interaction.user.id)
     ) {
-      throw new UserError(
-        'Commande réservée aux membres ayant « Gérer le serveur ».'
+      await interaction.editReply(
+        'Cette commande est réservée aux utilisateurs autorisés par Netcord.'
       );
+      return;
     }
 
-    if (!ready || stopping) {
-      throw new UserError(
-        'Le bot démarre ou s’arrête. Réessaie dans quelques instants.'
+    if (!ready || stopping || busy) {
+      await interaction.editReply(
+        'Démarrage ou opération en cours. Réessaie dans quelques instants.'
       );
-    }
-
-    if (busy) {
-      throw new UserError('Une commande est déjà en cours.');
+      return;
     }
 
     busy = true;
 
     try {
-      if (interaction.commandName === 'live-quitter') {
-        disconnect();
-        await interaction.editReply('Déconnecté du live.');
+      if (interaction.options.getSubcommand() === 'quitter') {
+        actors.forEach(disconnect);
+
+        await interaction.editReply(
+          'Tous les bots sont déconnectés du live.'
+        );
         return;
       }
 
-      if (connection) {
-        throw new UserError(
-          'Le bot est déjà connecté. Utilise /live-quitter avant de changer de salon.'
-        );
-      }
+      const channelId =
+        interaction.options.getChannel('salon', true).id;
 
-      const chosenChannel =
-        interaction.options.getChannel('salon', true);
-
-      const channel =
-        await interaction.guild.channels.fetch(
-          chosenChannel.id
-        );
-
-      if (
-        ![
-          ChannelType.GuildVoice,
-          ChannelType.GuildStageVoice,
-        ].includes(channel?.type)
-      ) {
-        throw new UserError(
-          'Choisis un salon vocal ou Stage de ce serveur.'
-        );
-      }
-
-      const me =
-        await interaction.guild.members.fetchMe();
-
-      if (
-        !channel.permissionsFor(me)?.has([
-          P.ViewChannel,
-          P.Connect,
-        ]) ||
-        !channel.joinable
-      ) {
-        throw new UserError(
-          'Salon inaccessible ou plein. Le bot doit pouvoir voir le salon et s’y connecter.'
-        );
-      }
-
-      selectedChannel = channel.id;
-
-      const current = joinVoiceChannel({
-        channelId: channel.id,
-        guildId,
-        adapterCreator:
-          interaction.guild.voiceAdapterCreator,
-
-        // Présence uniquement : bot muet et sourd.
-        selfMute: true,
-        selfDeaf: true,
-      });
-
-      connection = current;
-
-      current.on('error', error => {
-        logError('Connexion vocale', error);
-      });
-
-      current.on('stateChange', (_, state) => {
-        if (connection !== current) return;
-
-        if (state.status === V.Ready) {
-          clearTimeout(reconnectTimer);
-          reconnectTimer = null;
-        } else if (
-          state.status === V.Disconnected &&
-          !reconnectTimer
-        ) {
-          // Laisser la bibliothèque rétablir
-          // une coupure transitoire.
-          reconnectTimer = setTimeout(() => {
-            if (connection === current) {
-              disconnect();
-            }
-          }, 20000);
-        } else if (state.status === V.Destroyed) {
-          disconnect();
-        }
-      });
-
-      try {
-        await entersState(current, V.Ready, 30000);
-
-        if (
-          connection !== current ||
-          me.voice.channelId !== channel.id
-        ) {
-          throw new UserError(
-            'Connexion interrompue ou bot déplacé pendant la connexion.'
-          );
-        }
-
-        // Sur un Stage, rester dans le public.
-        if (channel.type === ChannelType.GuildStageVoice) {
-          await me.voice.setSuppressed(true);
-        }
-
+      if (actors.some(a => a.connection)) {
         await interaction.editReply(
-          'Connecté au live, muet. Aucun audio reçu ou enregistré.'
+          'Utilise /netcord-live quitter avant de rejoindre un autre live.'
         );
-      } catch (error) {
-        disconnect();
-
-        if (error instanceof UserError) {
-          throw error;
-        }
-
-        logError('Connexion impossible', error);
-
-        throw new UserError(
-          'Connexion impossible. Vérifie les permissions et les logs Railway.'
-        );
+        return;
       }
+
+      const failures = [];
+
+      // Connecter les bots par petits lots.
+      for (let i = 0; i < actors.length; i += 3) {
+        const batch = actors.slice(i, i + 3);
+
+        const results = await Promise.allSettled(
+          batch.map(a => join(a, channelId))
+        );
+
+        results.forEach((result, n) => {
+          if (result.status === 'rejected') {
+            failures.push(batch[n].index + 1);
+            logError(
+              `Connexion bot ${batch[n].index + 1}`,
+              result.reason
+            );
+          }
+        });
+
+        if (i + 3 < actors.length) await delay(1000);
+      }
+
+      const count = actors.filter(
+        a => a.connection?.state.status === V.Ready
+      ).length;
+
+      await interaction.editReply(
+        `${count}/${actors.length} bots connectés, muets et sourds.` +
+        (
+          failures.length
+            ? ` Échec des bots : ${failures.join(', ')}. Vérifie leurs permissions et la capacité du salon.`
+            : ''
+        )
+      );
     } finally {
       busy = false;
     }
   } catch (error) {
     logError('Commande', error);
 
-    try {
-      await interaction.editReply(
-        error instanceof UserError
-          ? error.message
-          : 'Une erreur est survenue. Consulte les logs Railway.'
-      );
-    } catch {
-      // Aucune réponse publique de secours.
-    }
+    await interaction.editReply(
+      'Erreur. Consulte les logs Railway.'
+    ).catch(() => {});
   }
 });
 
-client.on(Events.VoiceStateUpdate, (before, after) => {
-  if (
-    !connection ||
-    after.id !== client.user?.id ||
-    after.guild.id !== guildId
-  ) {
-    return;
-  }
-
-  if (
-    before.channelId === selectedChannel &&
-    after.channelId !== selectedChannel
-  ) {
-    // Ne pas revenir après une exclusion ou un déplacement.
-    disconnect();
-  } else if (
-    after.channel?.type === ChannelType.GuildStageVoice &&
-    after.suppress === false
-  ) {
-    // Revenir dans le public si le bot est promu intervenant.
-    void after.setSuppressed(true).catch(error => {
-      logError('Retour en auditeur', error);
-      disconnect();
-    });
-  }
-});
-
-client.on(Events.Error, error => {
-  logError('Discord', error);
-});
-
-client.once(Events.ClientReady, async () => {
-  let step = 'Vérification du serveur';
-
-  try {
-    console.log(
-      `Bot connecté: ${client.user.tag} (${client.user.id})`
+async function start() {
+  for (const actor of actors) {
+    const connected = new Promise(resolve =>
+      actor.client.once(Events.ClientReady, resolve)
     );
 
-    console.log(`Serveur demandé: ${guildId}`);
+    await actor.client.login(actor.token);
+    await connected;
 
-    console.log(
-      `Serveurs visibles: ${
-        [...client.guilds.cache.keys()].join(', ') ||
-        'aucun'
-      }`
-    );
+    if (stopping) return;
 
-    // Utiliser le serveur reçu via la connexion Discord.
-    // Faire une requête API uniquement s’il manque en cache.
-    const guild =
-      client.guilds.cache.get(guildId) ||
-      await client.guilds.fetch(guildId);
+    const guild = actor.client.guilds.cache.get(guildId);
 
-    // Enregistrer uniquement les deux commandes du bot.
-    for (const command of commands) {
-      step = `Enregistrement de /${command.name}`;
-
-      await guild.commands.create(
-        command.toJSON()
+    if (!guild) {
+      throw new Error(
+        `Bot ${actor.index + 1} absent du serveur`
       );
     }
 
-    ready = true;
-
     console.log(
-      'Bot prêt : présence uniquement, muet et sourd.'
-    );
-  } catch (error) {
-    // Diagnostic complet dans une seule ligne rouge.
-    // Le token n’est jamais affiché.
-    console.error(
-      `Démarrage - ${step}: ${
-        error?.code || error?.name || 'Erreur'
-      } | ` +
-      `Bot: ${client.user.tag} (${client.user.id}) | ` +
-      `Serveur demandé: ${guildId} | ` +
-      `Serveurs visibles: ${
-        [...client.guilds.cache.keys()].join(', ') ||
-        'aucun'
-      }`
+      `Bot ${actor.index + 1} connecté : ${actor.client.user.tag}`
     );
 
-    shutdown(1);
+    // Supprimer les anciennes commandes du bot de présence.
+    const names = new Set([
+      'live-rejoindre',
+      'live-quitter',
+      'netcord-live',
+    ]);
+
+    for (const manager of [
+      guild.commands,
+      actor.client.application.commands,
+    ]) {
+      const existing = await manager.fetch();
+
+      for (const old of existing.values()) {
+        const keepControllerCommand =
+          actor.index === 0 &&
+          manager === guild.commands &&
+          old.name === 'netcord-live';
+
+        if (names.has(old.name) && !keepControllerCommand) {
+          await manager.delete(old.id);
+        }
+      }
+    }
+
+    await delay(1000);
   }
-});
+
+  await controller.guilds.cache
+    .get(guildId)
+    .commands.create(command.toJSON());
+
+  ready = true;
+
+  console.log(
+    `Netcord prêt : ${actors.length} bots, une seule commande.`
+  );
+}
 
 function shutdown(code = 0) {
   if (stopping) return;
-
   stopping = true;
 
-  disconnect();
-  client.destroy();
+  actors.forEach(actor => {
+    disconnect(actor);
+    actor.client.destroy();
+  });
 
   process.exit(code);
 }
@@ -373,11 +399,11 @@ process.once('uncaughtException', error => {
 });
 
 process.once('unhandledRejection', error => {
-  logError('Promesse non traitée', error);
+  logError('Erreur fatale', error);
   shutdown(1);
 });
 
-client.login(process.env.DISCORD_TOKEN).catch(error => {
-  logError('Connexion Discord', error);
+start().catch(error => {
+  logError('Démarrage', error);
   shutdown(1);
 });
