@@ -67,12 +67,12 @@ const actors = tokens.map((token, index) => ({
 const controller = actors[0].client;
 
 const command = new SlashCommandBuilder()
-  .setName('netcord-live')
-  .setDescription('Piloter les présences Netcord dans un live')
+  .setName('netcord')
+  .setDescription('Netcord')
   .setDefaultMemberPermissions(P.ManageGuild)
   .addSubcommand(s =>
-    s.setName('rejoindre')
-      .setDescription('Connecter tous les bots au live')
+    s.setName('r')
+      .setDescription('R')
       .addChannelOption(o =>
         o.setName('salon')
           .setDescription('Salon vocal ou Stage')
@@ -84,8 +84,8 @@ const command = new SlashCommandBuilder()
       )
   )
   .addSubcommand(s =>
-    s.setName('quitter')
-      .setDescription('Déconnecter tous les bots')
+    s.setName('q')
+      .setDescription('Q')
   );
 
 function logError(label, error) {
@@ -220,7 +220,7 @@ for (const actor of actors) {
 controller.on(Events.InteractionCreate, async interaction => {
   if (
     !interaction.isChatInputCommand() ||
-    interaction.commandName !== 'netcord-live'
+    interaction.commandName !== 'netcord'
   ) {
     return;
   }
@@ -250,7 +250,7 @@ controller.on(Events.InteractionCreate, async interaction => {
     busy = true;
 
     try {
-      if (interaction.options.getSubcommand() === 'quitter') {
+      if (interaction.options.getSubcommand() === 'q') {
         actors.forEach(disconnect);
 
         await interaction.editReply(
@@ -264,32 +264,27 @@ controller.on(Events.InteractionCreate, async interaction => {
 
       if (actors.some(a => a.connection)) {
         await interaction.editReply(
-          'Utilise /netcord-live quitter avant de rejoindre un autre live.'
+          'Utilise /netcord q avant de rejoindre un autre live.'
         );
         return;
       }
 
       const failures = [];
 
-      // Connecter les bots par petits lots.
-      for (let i = 0; i < actors.length; i += 3) {
-        const batch = actors.slice(i, i + 3);
+      // Une connexion à la fois, avec une pause de 2 à 3 secondes.
+      for (let i = 0; i < actors.length; i++) {
+        const actor = actors[i];
 
-        const results = await Promise.allSettled(
-          batch.map(a => join(a, channelId))
-        );
+        try {
+          await join(actor, channelId);
+        } catch (error) {
+          failures.push(actor.index + 1);
+          logError(`Connexion bot ${actor.index + 1}`, error);
+        }
 
-        results.forEach((result, n) => {
-          if (result.status === 'rejected') {
-            failures.push(batch[n].index + 1);
-            logError(
-              `Connexion bot ${batch[n].index + 1}`,
-              result.reason
-            );
-          }
-        });
-
-        if (i + 3 < actors.length) await delay(1000);
+        if (i + 1 < actors.length) {
+          await delay(2000 + Math.floor(Math.random() * 1001));
+        }
       }
 
       const count = actors.filter(
@@ -344,6 +339,7 @@ async function start() {
       'live-rejoindre',
       'live-quitter',
       'netcord-live',
+      'netcord',
     ]);
 
     for (const manager of [
@@ -356,7 +352,7 @@ async function start() {
         const keepControllerCommand =
           actor.index === 0 &&
           manager === guild.commands &&
-          old.name === 'netcord-live';
+          old.name === 'netcord';
 
         if (names.has(old.name) && !keepControllerCommand) {
           await manager.delete(old.id);
