@@ -1,8 +1,13 @@
 'use strict';
 
 const {
-  Client, GatewayIntentBits, Events, ChannelType,
-  PermissionFlagsBits: P, SlashCommandBuilder, MessageFlags,
+  Client,
+  GatewayIntentBits,
+  Events,
+  ChannelType,
+  PermissionFlagsBits: P,
+  SlashCommandBuilder,
+  MessageFlags,
 } = require('discord.js');
 
 const {
@@ -34,13 +39,21 @@ if (
 }
 
 const tokens = [];
+const tokenNumbers = [];
 
 for (let i = 1; i <= 30; i++) {
   const token = process.env[`BOT_TOKEN_${i}`]?.trim();
-  if (token) tokens.push(token);
+
+  if (token) {
+    tokens.push(token);
+    tokenNumbers.push(i);
+  }
 }
 
-if (!tokens.length || new Set(tokens).size !== tokens.length) {
+if (
+  !tokens.length ||
+  new Set(tokens).size !== tokens.length
+) {
   throw new Error(
     'Ajoute BOT_TOKEN_1 puis les autres jetons, tous différents.'
   );
@@ -53,6 +66,7 @@ let stopping = false;
 const actors = tokens.map((token, index) => ({
   token,
   index,
+  number: tokenNumbers[index],
   connection: null,
   channelId: null,
   timer: null,
@@ -70,6 +84,7 @@ const command = new SlashCommandBuilder()
   .setName('netcord')
   .setDescription('Netcord')
   .setDefaultMemberPermissions(P.ManageGuild)
+
   .addSubcommand(s =>
     s.setName('r')
       .setDescription('R')
@@ -83,15 +98,32 @@ const command = new SlashCommandBuilder()
           )
       )
   )
+
   .addSubcommand(s =>
     s.setName('q')
       .setDescription('Q')
   );
 
 function logError(label, error) {
-  // Ne pas afficher les objets d’erreur pouvant contenir des secrets.
+  let message = String(
+    error?.message || 'Erreur sans détail'
+  );
+
+  // Ne jamais afficher les tokens dans les logs.
+  for (const token of tokens) {
+    message = message.replaceAll(
+      token,
+      '[TOKEN MASQUÉ]'
+    );
+  }
+
+  message = message.replace(
+    /Bot\s+[A-Za-z0-9._-]+/g,
+    'Bot [TOKEN MASQUÉ]'
+  );
+
   console.error(
-    `${label}: ${error?.code || error?.name || 'Erreur'}`
+    `${label}: ${error?.code || error?.name || 'Erreur'} | ${message}`
   );
 }
 
@@ -100,6 +132,7 @@ function disconnect(actor) {
   actor.timer = null;
 
   const old = actor.connection;
+
   actor.connection = null;
   actor.channelId = null;
 
@@ -113,7 +146,10 @@ const delay = ms =>
 
 async function join(actor, channelId) {
   const guild = actor.client.guilds.cache.get(guildId);
-  if (!guild) throw new Error('Serveur inaccessible');
+
+  if (!guild) {
+    throw new Error('Serveur inaccessible');
+  }
 
   const channel = await guild.channels.fetch(channelId);
   const me = await guild.members.fetchMe();
@@ -123,7 +159,10 @@ async function join(actor, channelId) {
       ChannelType.GuildVoice,
       ChannelType.GuildStageVoice,
     ].includes(channel?.type) ||
-    !channel.permissionsFor(me)?.has([P.ViewChannel, P.Connect]) ||
+    !channel.permissionsFor(me)?.has([
+      P.ViewChannel,
+      P.Connect,
+    ]) ||
     !channel.joinable
   ) {
     throw new Error('Salon inaccessible ou plein');
@@ -137,7 +176,7 @@ async function join(actor, channelId) {
     guildId,
     adapterCreator: guild.voiceAdapterCreator,
 
-    // Indispensable pour plusieurs bots dans un même programme.
+    // Groupe distinct pour chaque bot.
     group: actor.client.user.id,
 
     selfMute: true,
@@ -146,9 +185,9 @@ async function join(actor, channelId) {
 
   actor.connection = connection;
 
-  connection.on('error', error =>
-    logError(`Vocal bot ${actor.index + 1}`, error)
-  );
+  connection.on('error', error => {
+    logError(`Vocal bot ${actor.number}`, error);
+  });
 
   connection.on('stateChange', (_, state) => {
     if (actor.connection !== connection) return;
@@ -160,7 +199,10 @@ async function join(actor, channelId) {
       state.status === V.Disconnected &&
       !actor.timer
     ) {
-      actor.timer = setTimeout(() => disconnect(actor), 20000);
+      actor.timer = setTimeout(
+        () => disconnect(actor),
+        20000
+      );
     } else if (state.status === V.Destroyed) {
       disconnect(actor);
     }
@@ -186,155 +228,191 @@ async function join(actor, channelId) {
 }
 
 for (const actor of actors) {
-  actor.client.on(Events.Error, error =>
-    logError(`Discord bot ${actor.index + 1}`, error)
-  );
-
-  actor.client.on(Events.VoiceStateUpdate, (before, after) => {
-    if (
-      !actor.connection ||
-      after.id !== actor.client.user?.id ||
-      after.guild.id !== guildId
-    ) {
-      return;
-    }
-
-    if (
-      before.channelId === actor.channelId &&
-      after.channelId !== actor.channelId
-    ) {
-      // Respecter une exclusion ou un déplacement par un modérateur.
-      disconnect(actor);
-    } else if (
-      after.channel?.type === ChannelType.GuildStageVoice &&
-      after.suppress === false
-    ) {
-      void after.setSuppressed(true).catch(error => {
-        logError('Retour en auditeur', error);
-        disconnect(actor);
-      });
-    }
+  actor.client.on(Events.Error, error => {
+    logError(`Discord bot ${actor.number}`, error);
   });
+
+  actor.client.on(
+    Events.VoiceStateUpdate,
+    (before, after) => {
+      if (
+        !actor.connection ||
+        after.id !== actor.client.user?.id ||
+        after.guild.id !== guildId
+      ) {
+        return;
+      }
+
+      if (
+        before.channelId === actor.channelId &&
+        after.channelId !== actor.channelId
+      ) {
+        // Respecter une exclusion ou un déplacement.
+        disconnect(actor);
+      } else if (
+        after.channel?.type ===
+          ChannelType.GuildStageVoice &&
+        after.suppress === false
+      ) {
+        void after.setSuppressed(true).catch(error => {
+          logError('Retour en auditeur', error);
+          disconnect(actor);
+        });
+      }
+    }
+  );
 }
 
-controller.on(Events.InteractionCreate, async interaction => {
-  if (
-    !interaction.isChatInputCommand() ||
-    interaction.commandName !== 'netcord'
-  ) {
-    return;
-  }
-
-  try {
-    await interaction.deferReply({
-      flags: MessageFlags.Ephemeral,
-    });
-
+controller.on(
+  Events.InteractionCreate,
+  async interaction => {
     if (
-      interaction.guildId !== guildId ||
-      !allowed.has(interaction.user.id)
+      !interaction.isChatInputCommand() ||
+      interaction.commandName !== 'netcord'
     ) {
-      await interaction.editReply(
-        'Cette commande est réservée aux utilisateurs autorisés par Netcord.'
-      );
       return;
     }
-
-    if (!ready || stopping || busy) {
-      await interaction.editReply(
-        'Démarrage ou opération en cours. Réessaie dans quelques instants.'
-      );
-      return;
-    }
-
-    busy = true;
 
     try {
-      if (interaction.options.getSubcommand() === 'q') {
-        actors.forEach(disconnect);
+      await interaction.deferReply({
+        flags: MessageFlags.Ephemeral,
+      });
 
+      if (
+        interaction.guildId !== guildId ||
+        !allowed.has(interaction.user.id)
+      ) {
         await interaction.editReply(
-          'Tous les bots sont déconnectés du live.'
+          'Cette commande est réservée aux utilisateurs autorisés par Netcord.'
         );
+
         return;
       }
 
-      const channelId =
-        interaction.options.getChannel('salon', true).id;
-
-      if (actors.some(a => a.connection)) {
+      if (!ready || stopping || busy) {
         await interaction.editReply(
-          'Utilise /netcord q avant de rejoindre un autre live.'
+          'Démarrage ou opération en cours. Réessaie dans quelques instants.'
         );
+
         return;
       }
 
-      const failures = [];
+      busy = true;
 
-      // Une connexion à la fois, avec une pause de 2 à 3 secondes.
-      for (let i = 0; i < actors.length; i++) {
-        const actor = actors[i];
+      try {
+        if (
+          interaction.options.getSubcommand() === 'q'
+        ) {
+          actors.forEach(disconnect);
 
-        try {
-          await join(actor, channelId);
-        } catch (error) {
-          failures.push(actor.index + 1);
-          logError(`Connexion bot ${actor.index + 1}`, error);
+          await interaction.editReply(
+            'Tous les bots sont déconnectés du live.'
+          );
+
+          return;
         }
 
-        if (i + 1 < actors.length) {
-          await delay(2000 + Math.floor(Math.random() * 1001));
+        const channelId =
+          interaction.options.getChannel(
+            'salon',
+            true
+          ).id;
+
+        if (actors.some(a => a.connection)) {
+          await interaction.editReply(
+            'Utilise /netcord q avant de rejoindre un autre live.'
+          );
+
+          return;
         }
+
+        const failures = [];
+
+        // Connexions successives, espacées de 2 à 3 secondes.
+        for (let i = 0; i < actors.length; i++) {
+          const actor = actors[i];
+
+          try {
+            await join(actor, channelId);
+          } catch (error) {
+            failures.push(actor.number);
+
+            logError(
+              `Connexion bot ${actor.number}`,
+              error
+            );
+          }
+
+          if (i + 1 < actors.length) {
+            await delay(
+              2000 + Math.floor(Math.random() * 1001)
+            );
+          }
+        }
+
+        const count = actors.filter(
+          a => a.connection?.state.status === V.Ready
+        ).length;
+
+        await interaction.editReply(
+          `${count}/${actors.length} bots connectés, muets et sourds.` +
+          (
+            failures.length
+              ? ` Échec des bots : ${failures.join(', ')}. Vérifie leurs permissions et la capacité du salon.`
+              : ''
+          )
+        );
+      } finally {
+        busy = false;
       }
-
-      const count = actors.filter(
-        a => a.connection?.state.status === V.Ready
-      ).length;
+    } catch (error) {
+      logError('Commande', error);
 
       await interaction.editReply(
-        `${count}/${actors.length} bots connectés, muets et sourds.` +
-        (
-          failures.length
-            ? ` Échec des bots : ${failures.join(', ')}. Vérifie leurs permissions et la capacité du salon.`
-            : ''
-        )
-      );
-    } finally {
-      busy = false;
+        'Erreur. Consulte les logs Railway.'
+      ).catch(() => {});
     }
-  } catch (error) {
-    logError('Commande', error);
-
-    await interaction.editReply(
-      'Erreur. Consulte les logs Railway.'
-    ).catch(() => {});
   }
-});
+);
 
 async function start() {
   for (const actor of actors) {
-    const connected = new Promise(resolve =>
-      actor.client.once(Events.ClientReady, resolve)
+    const connected = new Promise(resolve => {
+      actor.client.once(Events.ClientReady, resolve);
+    });
+
+    console.log(
+      `Connexion du bot ${actor.number} (BOT_TOKEN_${actor.number})...`
     );
 
-    await actor.client.login(actor.token);
-    await connected;
+    try {
+      await actor.client.login(actor.token);
+      await connected;
+    } catch (error) {
+      logError(
+        `Échec de connexion BOT_TOKEN_${actor.number}`,
+        error
+      );
+
+      throw error;
+    }
 
     if (stopping) return;
 
-    const guild = actor.client.guilds.cache.get(guildId);
+    const guild =
+      actor.client.guilds.cache.get(guildId);
 
     if (!guild) {
       throw new Error(
-        `Bot ${actor.index + 1} absent du serveur`
+        `Le bot ${actor.number} (BOT_TOKEN_${actor.number}) n’est pas sur le serveur DISCORD_GUILD_ID. Invite ce bot sur le serveur avant de relancer.`
       );
     }
 
     console.log(
-      `Bot ${actor.index + 1} connecté : ${actor.client.user.tag}`
+      `Bot ${actor.number} connecté : ${actor.client.user.tag}`
     );
 
-    // Supprimer les anciennes commandes du bot de présence.
+    // Supprimer les anciennes commandes de présence.
     const names = new Set([
       'live-rejoindre',
       'live-quitter',
@@ -346,7 +424,18 @@ async function start() {
       guild.commands,
       actor.client.application.commands,
     ]) {
-      const existing = await manager.fetch();
+      let existing;
+
+      try {
+        existing = await manager.fetch();
+      } catch (error) {
+        logError(
+          `Lecture des commandes du bot ${actor.number}`,
+          error
+        );
+
+        throw error;
+      }
 
       for (const old of existing.values()) {
         const keepControllerCommand =
@@ -354,14 +443,30 @@ async function start() {
           manager === guild.commands &&
           old.name === 'netcord';
 
-        if (names.has(old.name) && !keepControllerCommand) {
-          await manager.delete(old.id);
+        if (
+          names.has(old.name) &&
+          !keepControllerCommand
+        ) {
+          try {
+            await manager.delete(old.id);
+          } catch (error) {
+            logError(
+              `Suppression de la commande ${old.name}, bot ${actor.number}`,
+              error
+            );
+
+            throw error;
+          }
         }
       }
     }
 
     await delay(1000);
   }
+
+  console.log(
+    'Enregistrement des commandes /netcord r et /netcord q...'
+  );
 
   await controller.guilds.cache
     .get(guildId)
@@ -376,6 +481,7 @@ async function start() {
 
 function shutdown(code = 0) {
   if (stopping) return;
+
   stopping = true;
 
   actors.forEach(actor => {
